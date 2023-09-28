@@ -1,0 +1,225 @@
+import re
+import PyPDF2
+import fitz
+import dateparser
+from datetime import date
+from tika import parser
+import pymssql
+import pandas as pd
+conn = pymssql.connect('edit this to your mysql database ipaddress')
+cursor = conn.cursor(as_dict=True)
+cursor.execute('SELECT  CaChargeCode as CaChargeCode, ChargeID FROM carcharge where idcakey = 000005430')
+charges = cursor.fetchall()
+conn.close()
+charges = pd.DataFrame(charges)
+
+
+def tikaText(PDF: str):
+    raw = parser.from_file(PDF)
+    text = raw['content'].split('\n')
+    return text
+
+def findline(word, arr):
+    for i in range(len(arr)):
+        if word in arr[i]:
+            return i
+    return -1
+
+def Text(pdf: str):
+    with fitz.open(pdf) as doc:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+
+    text = text.split('\n')
+
+    file = open(pdf, 'rb')
+    pdfReader = PyPDF2.PdfFileReader(file)
+    totalPages = pdfReader.numPages
+
+    return text, totalPages
+
+def cleaned_text(pdf: str):
+    text, totalPages = Text(pdf)
+    text = text[:findline('Rajustement de poids', text)]
+    text1 = text[findline('Renseignements sur les expéditions', text):findline('Rajustement de poids', text)]
+    sliced = text[findline('ACCOUNTS PAYABLE', text):findline('Page nº : 1 de', text) ]
+    
+    constant_info = {}
+    shipment_list = [] 
+    for number, line in enumerate(sliced):
+        if 'ACCOUNTS PAYABLE' in line:
+            customer_name = sliced[number + 1]
+            customer_address = sliced[number + 2]
+            customer_location = sliced[number + 3].split()
+            if len(customer_location) == 3:
+                customer_city = customer_location[0]
+                customer_province = customer_location[1]
+                customer_postal_code = customer_location[2]
+            constant_info['customer_name'] = customer_name
+            constant_info['customer_address'] = customer_address
+            constant_info['customer_city'] = customer_city
+            constant_info['customer_province'] = customer_province
+            constant_info['customer_postal_code'] = customer_postal_code
+        
+        if 'Facture nº :' in line:
+            invoice_number = sliced[number].split(':')[1].strip()
+            constant_info['invoice_number'] = invoice_number
+
+        if 'Date de facturation :' in line:
+            invoice_date = sliced[number].split(':')[1].strip()
+            invoice_date = dateparser.parse(invoice_date).strftime('%Y%m%d')
+            constant_info['invoice_date'] = invoice_date
+
+    acc_list = []
+    for number, line in enumerate(text1):
+        if 'Numéro de repérage' in line:
+            waybill_number1 = text1[number + 1]
+        for charge in charges.CaChargeCode:
+            if charge == line:
+                charge_name = charge
+                charge_id = charges[charges.CaChargeCode == charge].ChargeID.values[0]
+                for value in text1[number:]:
+                    if re.match(r'\d{1,},\d{2} \$', value):
+                        value = value.split()[0].replace(',', '.')
+                        acc_entry = {'waybill_number1': waybill_number1, 'charge_name': charge_name, 'charge_value': value, 'charge_id': charge_id}
+                        acc_list.append(acc_entry)
+                        break
+                break
+
+    constant_info['acc_list'] = acc_list
+    current_shipment = {} 
+    for number, line in enumerate(text):
+        if "Renseignements sur les expéditions" in line:
+            shipper_name = text[number + 1]
+            constant_info['shipper_name'] = shipper_name
+        if 'Total de cette facture' in line:
+            invoice_total = text[number + 1].split('$')[0].replace(',', '.').replace(' ','').strip()
+            constant_info['invoice_total'] = invoice_total
+        if 'Frais de transport nets' in line:
+            net_charges_str = text[number + 1].split('$')[0].replace(',', '.').strip()
+            net_charges = float(''.join(filter(str.isdigit, net_charges_str))) / 100
+            total_fuel_str = text[number + 3].split('$')[0].replace(',', '.').strip()
+            total_fuel = float(''.join(filter(str.isdigit, total_fuel_str))) / 100
+            base_percentage = net_charges / (net_charges + total_fuel)
+        if 'Transport' in line:
+            shipment_number = text[number - 2]
+            consignee_name = text[number - 1]
+            consignee_address = text[number + 4]
+            Base_charge_str = text[number + 1].split('$')[0].replace(',', '.').strip()
+            Base_charge_form = float(''.join(filter(str.isdigit, Base_charge_str))) / 100
+            Base_charge_calc = Base_charge_form * base_percentage
+            Base_charge = "{:.2f}".format(Base_charge_calc)
+            fuel_charge_calc = Base_charge_form - Base_charge_calc
+            fuel_charge = "{:.2f}".format(fuel_charge_calc)
+            current_shipment['shipment_number'] = shipment_number
+            current_shipment['consignee_name'] = consignee_name
+            current_shipment['consignee_address'] = consignee_address
+            current_shipment['base_charge'] = Base_charge
+            current_shipment['fuel_charge'] = fuel_charge
+        if 'Numéro de repérage' in line:
+            waybill_number = text[number + 1]
+            current_shipment['waybill_number'] = waybill_number
+        if 'Pièces' in line:
+            pieces = text[number + 1]
+            current_shipment['pieces'] = pieces
+        
+        consignee_location_pattern = re.search(r'^(.*?)\s+([A-Z]{2})\s+([A-Z]\d[A-Z]\d[A-Z]\d)$', line)
+        if consignee_location_pattern:
+            consignee_city = consignee_location_pattern.group(1)
+            consignee_province = consignee_location_pattern.group(2)
+            consignee_postal_code = consignee_location_pattern.group(3)
+            current_shipment['consignee_city'] = consignee_city
+            current_shipment['consignee_postal_code'] = consignee_postal_code
+            current_shipment['consignee_province'] = consignee_province
+        
+        if 'Poids déclaré' in line:
+            current_shipment['declared_weight'] = text[number + 1].split()[0].replace(',', '.').strip()
+        
+        if 'Poids facturé' in line:
+            current_shipment['reference_number'] = text[number + 2].split()[-1].strip()
+            current_shipment['billed_weight'] = text[number + 1].split()[0].replace(',', '.').strip()
+            shipment_list.append(current_shipment.copy()) 
+            current_shipment = {}
+
+
+    constant_info['shipment_list'] = shipment_list
+    return constant_info
+
+constant_info = cleaned_text('Apr 7th 2023.pdf')
+EDI_Output = open('Apr 7th 2023.txt', 'w')
+
+shipment_list = constant_info.get('shipment_list', [])
+acc_list = constant_info.get('acc_list', [])
+
+
+invoice_number = constant_info.get('invoice_number', '')
+invoice_date = constant_info.get('invoice_date', '')
+invoice_total = constant_info.get('invoice_total', '')
+customer_name = constant_info.get('customer_name', '')
+customer_address = constant_info.get('customer_address', '')
+customer_city = constant_info.get('customer_city', '')
+customer_province = constant_info.get('customer_province', '')
+customer_postal_code = constant_info.get('customer_postal_code', '')
+customer_country = constant_info.get('customer_country', '')
+shipper_name = constant_info.get('shipper_name', '')
+
+EDI = f'''ISA*00**00**ZZ*000005430*ZZ*000000144*20220908*1250*U*00401*000012253*0*P*~
+GS*IM*000005430*000000144*20220908*125003*12248*X*004010~
+ST*210*1000~
+B3**{invoice_number}**MX**{invoice_date}*{invoice_total}****PRLA*~
+C3*CAD~
+N9*12*~
+N9*BM*Loomis Express~
+N1*CS*{customer_name}~
+N3*{customer_address}~
+N4*{customer_city}*{customer_province}*{customer_postal_code}*CANADA~
+'''
+
+i = 0
+lcounter = 0
+for current_shipment in shipment_list:
+    waybill_number = current_shipment.get('waybill_number', '')
+    pieces = current_shipment.get('pieces', '')
+    declared_weight = current_shipment.get('declared_weight', '')
+    billed_weight = current_shipment.get('billed_weight', '')
+    reference_number = current_shipment.get('reference_number', '')
+    consignee_name = current_shipment.get('consignee_name', '')
+    consignee_address = current_shipment.get('consignee_address', '')
+    consignee_city = current_shipment.get('consignee_city', '')
+    consignee_province = current_shipment.get('consignee_province', '')
+    consignee_postal_code = current_shipment.get('consignee_postal_code', '')
+    Base_charge = current_shipment.get('base_charge', '')
+    fuel_charge = current_shipment.get('fuel_charge', '')
+    Total = current_shipment.get('Total', '')
+
+    i += 1
+    lcounter = 0
+    EDI += f'LX*{i}~\n'
+    EDI += f"N9*WY*{waybill_number}~\n"
+    if reference_number:
+        EDI += f"N9*BM*{reference_number}~\n"
+    EDI += f"N1*SH*{constant_info.get('shipper_name', '')}~\n"
+    EDI += f"N1*CN*{consignee_name}~\n"
+    EDI += f"N3*{consignee_address}~\n"
+    EDI += f"N4*{consignee_city}*{consignee_province}*{consignee_postal_code}*CANADA~\n"
+    EDI += f"L0*1***{declared_weight}*B***{pieces}*PCS**LB~\n"
+    EDI += f"L0*2***{billed_weight}*A3******~\n"
+    lcounter += 1
+    EDI += f"L1*{lcounter}***{Base_charge}****Bas*Transport~\n"
+    lcounter += 1
+    EDI += f"L1*{lcounter}***{fuel_charge}****F*Fuel~\n"
+    lcounter += 1
+    for acc in acc_list:
+        if acc.get('waybill_number1', '') == waybill_number:
+            EDI += f"L1*{lcounter}***{acc.get('charge_value', '')}****{acc.get('charge_id', '')}*{acc.get('charge_name', '')}~\n"
+            lcounter += 1
+    
+EDI += '''SE*10222*11217265~
+GE*1*17856~
+IEA*1*000017866~'''
+
+EDI_Output.write(EDI)
+EDI_Output.close()
+
+print("EDI data generated and saved to 'Apr 7th 2023.txt'.")            

@@ -1,0 +1,291 @@
+import tika
+tika.initVM()
+from tika import parser
+import fitz
+import PyPDF2
+import re
+
+
+def tikaText(PDF: str):
+    raw = parser.from_file(f'{PDF}')
+
+    text = raw['content'].split('\n')
+    return text
+def findline(word,arr):
+    for i in range(len(arr)):
+        if word in arr[i]:
+            return i
+            break
+    return -1
+def findAddress(PDF:str):
+    text = tikaText(PDF)
+    text = text[findline('Total \xa0$', text)+2:findline('Total \xa0$', text) + 10]
+    address = []
+    for line in text:
+        if len(line) > 0:
+            address.append(line)
+        else:
+            break
+    del address[1:-2]
+    return address
+
+def findPageLines(word,arr):
+    pageLines = []
+    for i in range(len(arr)):
+        if word in arr[i]:
+            pageLines.append(i)
+    return pageLines
+
+
+def findline(word,arr):
+    for i in range(len(arr)):
+        if word in arr[i]:
+            return i
+            break
+    return -1
+
+def Text(pdf: str):
+
+
+    with fitz.open(pdf) as doc:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+
+
+
+    text = text.split('\n')
+    '''
+    try:
+      text.remove('Prior invoice cycle')
+    except:
+      pass
+    '''
+
+
+    file = open(pdf, 'rb')
+    pdfReader = PyPDF2.PdfFileReader(file)
+    totalPages = pdfReader.numPages
+
+    shipTo = findline('Items shipped by',text)
+    returnTo = findline('Items returned to ', text)
+
+
+    text = text[findline(f'Page 3 / {totalPages}',text):]
+
+
+
+
+    pageBreaks = []
+    pageBreaks = findPageLines(f' / {totalPages}', text)
+
+
+    textWithIndices = [*enumerate(text)]
+
+
+
+    return text , totalPages
+
+
+def cleaned_text (text:str):
+    text, totalPages = Text(f'1.pdf')
+    try:
+        directSegment = text[:findline('Items returned to ', text)]
+    except:
+        try:
+            directSegment = text[:findline('Credit',text)]
+        except:
+            directSegment = text
+
+
+    try:
+        reversedSegment = text[findline('Items returned to ', text):]
+    except:
+        pass
+
+    try:
+        creditSegment = text[findline('Règlement des réclamations',text):]
+    except:
+        pass
+
+    shippedBy= directSegment[findline('Items shipped by ',directSegment)][17:]
+
+    pageBreaks = []
+    pageBreaks = findPageLines(f' / {totalPages}', directSegment)
+    textWithIndices = [*enumerate(text)]
+    numberOfPages = len(pageBreaks)
+
+    for _ in range(numberOfPages):
+        pageBreaks = []
+        pageBreaks = findPageLines(f' / {totalPages}', directSegment)
+        del directSegment[pageBreaks[0]: findline('Amount',directSegment)+1]
+
+
+
+
+    dates = []
+
+    for i in range(len(directSegment)):
+        #WayBill
+        if re.match('^\d{12,}',directSegment[i]):
+            directSegment[i] = f"{directSegment[i]} -> Waybill"
+            #Address
+            directSegment[i+1] = 'deleted'
+        #The two strings below date
+        elif re.match('^\D\d{10}',directSegment[i]):
+            directSegment[i] = 'deleted'
+            #Second part of address
+            directSegment[i+1] = 'deleted'
+            #Weights
+            directSegment[i+2] = f"{directSegment[i+2]} -> Weight in KG"
+            directSegment[i+3] = f"{directSegment[i+3]} -> Volume Weight in KG"
+        #Weights if they are not attached to date
+        elif re.match('^\d{1,}\/\d{1,}',directSegment[i]):
+            directSegment[i] = 'deleted'
+            directSegment[i+1] = 'deleted'
+            directSegment[i+2] = f"{directSegment[i+2]} -> Weight in KG"
+            directSegment[i+3] = f"{directSegment[i+3]} -> Volume Weight in KG"
+        #Finding dates
+        elif re.match('^\d\d\d\d-\d\d-\d\d$',directSegment[i]):
+            directSegment[i] = f"{directSegment[i]} -> Date"
+            dates.append((i,directSegment[i]))
+        elif re.match('^\D\d\D \d\D\d',directSegment[i]):
+            directSegment[i] = f"{directSegment[i]} -> Postal Code"
+        elif re.match('^\D\d{8,}',directSegment[i]):
+            directSegment[i] = 'deleted'
+        #Dimensions
+        elif re.match('^\d{1,}(.\dx|x)\d{1,}(.\dx|x)\d{1,}(.\d|)',directSegment[i]):
+            directSegment[i] = 'deleted'
+
+
+    cleaned = [i for i in directSegment if i != 'deleted']
+    final = []
+    temp1 = []
+    temp2 = []
+    i = 0
+    items = set()
+    while i in range(len(cleaned)):
+        if 'Date' in cleaned[i]:
+            final.append(cleaned[i])
+        elif '->' in cleaned[i]:
+            temp1.append(cleaned[i])
+        else:
+            temp2.append(cleaned[i])
+            if re.match('^\D',cleaned[i]):
+                items.add(cleaned[i])
+        if "Total" in cleaned[i]:
+            temp2.append(cleaned[i+1])
+            i += 1
+
+            final += temp1
+            final += temp2
+
+            temp1 = []
+            temp2 = []
+
+        i += 1
+    del final[-2:]
+
+
+    return final
+
+
+
+
+
+
+
+chargesList = set()
+
+EDI_Output = open('EDI-Output.txt', 'w')
+
+
+address = findAddress(f'1.pdf')
+
+text,_ = Text(f'1.pdf')
+invoiceDate = text[3]
+customerNumber = text[5]
+invoiceNumber = text[7]
+
+final = cleaned_text(text)
+
+EDI = f'''ISA*00**00**ZZ*000001734*ZZ*000000144*20220908*1250*U*00401*000012253*0*P*~
+GS*IM*000001734*000000144*20220908*125003*12248*X*004010~
+ST*210*1000~
+B3**{invoiceNumber}**MX**{invoiceDate}*372022****PRLA*~
+C3*CAD~
+N9*12*{customerNumber}~
+'''
+
+
+i = 0
+
+element_counter = 0
+lcounter = 1
+
+for line in final:
+    if ' -> Date' in line:
+        date = line[:10].replace('-','')
+    elif ' -> Waybill' in line:
+        element_counter = 0
+        lcounter = 1
+        i += 1
+        EDI += f'LX*{i}~\n'
+        EDI += f'P1**{date}~\n'
+        EDI += f"N9*WY*{line[:line.index(' ->')]}~\n"
+    elif ' -> Weight in KG' in line:
+        EDI += f"L0*1***{line[:line.index(' ->')]}*B***1*PCS**KG~\n"
+    elif ' -> Volume Weight in KG' in line:
+        EDI += f"L0*2***{line[:line.index(' ->')]}*A3******~\n"
+    elif ' -> Postal Code' in line:
+        EDI += f"""N1*SH*{address[0]}~\n"""
+        EDI += f"""N3*{address[1]}~\n"""
+        EDI += f"""N4*{[str(i+' ') for i in address[-1].split(' ')[:-3]][0][:-1]}*{address[-1].split(' ')[-3]}*{' '.join(address[-1].split(' ')[-2:])}*~\n"""
+        EDI += f"""N1*CN**~\n"""
+        EDI += f"""N4***{line[:line.index(' ->')]}~\n"""
+    else:
+        if element_counter % 2 == 0:
+            elementName = str(line)
+            if  'Fuel Surcharge' in elementName :
+                elementName = 'Fuel Surcharge'
+            chargeID = 'TestingNone'
+            if str(chargeID) == 'TestingNone':
+                chargeID = None
+                chargesList.add(elementName)
+        else:
+            if lcounter == 1:
+                EDI += f"L1*{lcounter}***{line.replace('$','')}****BAS*{elementName}~\n"
+                chargesList.remove(elementName)
+            elif 'subtotal' in elementName.lower():
+                pass
+                lcounter -= 1
+            else:
+                EDI += f"L1*{lcounter}***{line.replace('$','')}****{chargeID}*{elementName}~\n"
+            lcounter += 1
+        element_counter += 1
+
+
+
+
+EDI += '''SE*10222*11217265~
+GE*1*17856~
+IEA*1*000017866~'''
+
+
+
+
+
+
+
+
+
+chargesList.remove('Subtotal')
+
+
+EDI_Output.write(EDI)
+EDI_Output.close()
+
+
+
+
+

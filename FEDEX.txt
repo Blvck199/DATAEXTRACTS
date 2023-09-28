@@ -1,0 +1,485 @@
+# -*- coding: utf-8 -*-
+import tika
+from tika import parser
+import fitz
+import PyPDF2
+import re
+from collections import defaultdict
+from IPython.utils import encoding
+from prompt_toolkit.filters.cli import shift_selection_mode
+import datetime
+import pymssql
+import pandas as pd
+import json
+conn = pymssql.connect('edit this to your mysql database ipaddress')
+cursor = conn.cursor(as_dict=True)
+cursor.execute('SELECT  CaChargeCode as CaChargeCode, ChargeID FROM carcharge where idcakey = 000007352 ')
+charges = cursor.fetchall()
+conn.close()
+charges = pd.DataFrame(charges)
+
+def tikaText(PDF: str):
+    raw = parser.from_file(PDF)
+    text = raw['content'].split('\n')
+    return text
+def findline(word, arr):
+    for i in range(len(arr)):
+        if word in arr[i]:
+            return i
+    return -1
+def findPageLines(word, arr):
+    pageLines = []
+    for i in range(len(arr)):
+        if word in arr[i]:
+            pageLines.append(i)
+    return pageLines
+def Text(pdf: str):
+    with fitz.open(pdf) as doc:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+
+    text = text.split('\n')
+
+    file = open(pdf, 'rb')
+    pdfReader = PyPDF2.PdfFileReader(file)
+    totalPages = pdfReader.numPages
+
+    return text, totalPages
+
+
+def findAddressAndZone(pdf: str):
+    text, totalpage = Text(pdf)
+    text = tikaText(pdf)
+    text = text[findline(f'4 de {totalpage}',text)-7 : ]
+
+
+    zone_switch = 0
+    testdict = {}
+    wb_zone = []
+    start_switch = False
+    for number,line in enumerate(text):
+        if line[:4] == 'Zone' and len(line) == 4:
+            zone_switch = 0
+            wb = text[number+3].strip()
+            if not re.match(r'\d{12,}$', wb):
+                wb = text[number+4].strip()
+                if not re.match(r'\d{12,}$', wb):
+                    wb = text[number+5].strip()
+            zone = text[number+7]
+            wb_zone.append({'wb':wb,'zone':zone})
+        if 'Orig/Dest' in line and text[number+1] == '':
+            zone_switch = 1
+            wb = text[number+3].strip()
+            if not re.match(r'\d{12,}$', wb):
+                wb = text[number+4].strip()
+                if not re.match(r'\d{12,}$', wb):
+                    wb = text[number+5].strip()
+        if zone_switch == 1 and line[:4] == 'Zone' and len(line) > 4:
+            zone = line[5:]
+            wb_zone.append({'wb':wb,'zone':zone})
+        if re.match(r'\s*\d{12,}$', line):
+            wbtest = line.strip()            
+            #testdict.append(wbtest)
+            start_switch = True
+        if ('Expéditeur   '== line or 'Expéditeur    ' == line) and start_switch == True:
+            temp = text[number +1 : number + 9]
+            shipper = temp[:temp.index('')]
+            if len(shipper) == 3:
+                shipper_name = shipper[0]
+                shipper_first_info = shipper[1]
+                shipper_location = shipper[2]
+                #testdict.append([carrier_name, carrier_first_info, location])
+            if len(shipper) == 4:
+                shipper_name = shipper[1]
+                shipper_first_info = shipper[2]
+                shipper_location = shipper[3]
+                #testdict.append([carrier_name, carrier_first_info, location])
+            if len(shipper) == 5:
+                shipper_name = shipper[1]
+                shipper_first_info = shipper[2]
+                shipper_location = shipper[4]
+                #testdict.append([carrier_name, carrier_first_info, location])
+        if ('Destinataire  ' == line or 'Destinataire       '==line) and start_switch == True:
+            temp = text[number +1 : number + 9]
+            consignee = temp[:temp.index('')]
+            if len(consignee) == 3:
+                consignee_name = consignee[0]
+                consignee_first_info = consignee[1]
+                location2 = consignee[2]
+                #testdict.append([consignee_name, consignee_first_info, location2])
+            if len(consignee) == 4:
+                consignee_name = consignee[1]
+                consignee_first_info = consignee[2]
+                location2 = consignee[3]
+                #testdict.append([consignee_name, consignee_first_info, location2])
+            if len(consignee) == 5:
+                consignee_name = consignee[1]
+                consignee_first_info = consignee[2]
+                location2 = consignee[4]
+                #testdict.append([consignee_name, consignee_first_info, location2])
+            testdict[wbtest] = [shipper_name, shipper_first_info, shipper_location],[consignee_name, consignee_first_info, location2]
+    #print(testdict)
+    return testdict, wb_zone
+
+def cleaned_text(pdf: str):
+    text, totalpage = Text(pdf)
+    sliced = text[findline(f'2 de {totalpage}', text):findline(f'3 de {totalpage}', text)]
+    month_map = {
+        'jan': '01', 'fév': '02', 'mar': '03', 'avr': '04', 'mai': '05', 'jun': '06',
+        'jul': '07', 'aoû': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'déc': '12'
+    }
+
+    invoice_date_str = text[findline('Date de facturation', text) + 1].strip()
+    for month_abbrev, month_numeric in month_map.items():
+        if month_abbrev in invoice_date_str:
+            invoice_date_str = invoice_date_str.replace(month_abbrev, month_numeric)
+            break
+
+    invoice_date_obj = datetime.datetime.strptime(invoice_date_str, '%d %m %Y')
+    invoice_date = invoice_date_obj.strftime('%Y/%m/%d').replace('/', '')
+
+    invoice_number = text[findline('N° de facture', text) + 1]
+    invoice_total = text[findline('Montant dû', text) + 7].split(' $')[0].replace(',', '.').replace(' ', '')
+    text = text[findline(f'4 de {totalpage}', text) - 7:]
+
+
+    for number, line in enumerate(text):
+        if line == 'N° de facture':
+            text[number:number + 8] = 8 * ['deleted']
+        if line == 'Orig/Dest' and text[number + 1] == 'Zone':
+            text[number + 1] = 'deleted'
+
+    # Getting rid of the extra info.
+    text = [(line) for line in text if len(str(line).strip()) > 0
+            and '�' not in line
+            and not re.match(r'Nº de suivi\s+\d{1,} .{1,}', line)
+            and 'Frais additionnels de carburant - FedEx a facturé des frais de carburant de' not in line
+            and 'Nous calculons vos frais selon le poids volumétrique de' not in line
+            and 'Documentation réglementaire erronée/manquante.' not in line
+            and 'Retard en raison du dédouanement réglementaire.' not in line
+            and 'deleted' not in line
+            and 'Tarifé à titre de: FedEx Intl Priority' not in line
+            ]
+
+    shipment_number = 0
+    fedex_express_shipment = []
+    fedex_ground_shipment = []
+    for i in range(len(text)):
+        if 'Détails FedEx Ground par Expéditeur' in text[i]:
+            break
+        if 'Date expédition:' in text[i]:
+            start = i
+        if 'Total' == text[i]:
+            end = i + 1
+            fedex_express_shipment.append(text[start:end + 1])
+
+    in_fedex_ground_section = False
+
+    for i in range(len(text)):
+        if 'Détails FedEx Ground par Expéditeur' in text[i]:
+            in_fedex_ground_section = True
+        if 'Date expédition:' in text[i]:
+            start = i
+        if 'Total' == text[i] and in_fedex_ground_section:
+            end = i + 1
+            fedex_ground_shipment.append(text[start:end + 1])
+        if in_fedex_ground_section and 'Total FedEx Ground' in text[i + 1]:
+            in_fedex_ground_section = False
+            break
+
+    my_dict = {}
+    my_dict["Invoice Number"] = invoice_number
+    my_dict["Invoice Date"] = invoice_date
+    my_dict["Invoice Total"] = invoice_total
+    
+    frais = {}
+    shipment_info = {}
+    for element in fedex_express_shipment:
+        shipment_info = {}
+        shipment_info["acc_list"] = []
+        for number, line in enumerate(element):
+            if 'Détails FedEx Ground par Expéditeur' in line:
+                break
+            if 'N° de suivi' in line:
+                waybill_match = re.search(r'\d{12,}', element[number + 5])
+                if waybill_match:
+                    shipment_info["Waybill"] = waybill_match.group(0)
+                    if 'Service' in element[number + 1]:
+                        shipment_info["Service Type"] = element[number + 6]
+                    if 'Emballage' in element[number + 2]:
+                        shipment_info["Packaging"] = element[number + 7]
+                else:
+                    waybill_match = re.search(r'\d{12,}', element[number + 4])
+                    if waybill_match:
+                        shipment_info["Waybill"] = waybill_match.group(0)
+                        if 'Service' in element[number + 1]:
+                            shipment_info["Service Type"] = element[number + 5]
+                        if 'Emballage' in element[number + 2]:
+                            shipment_info["Packaging"] = element[number + 6]
+
+            for charge in charges.CaChargeCode:
+                if charge == line:
+                    charge_name = charge
+                    charge_id = charges[charges.CaChargeCode == charge].ChargeID.values[0]
+                    if 'CAD' in element[number + 1] or 'USD' in element[number + 1]:
+                        continue
+                    value = element[number + 1].replace(',', '.').replace(' ', '')
+                    if '*' in charge_name:
+                        value = element[number + 2].replace(',', '.').replace(' ', '')
+                    acc_entry = {'charge_name': charge_name, 'charge_value': value, 'charge_id': charge_id}
+                    shipment_info["acc_list"].append(acc_entry)
+                    if 'Frais de carburant' in charge_name:
+                        frais["Frais de carburant"] = value
+                        #print(frais)
+            if 'Date expédition:' in line:
+                shipment_number += 1
+                shipment_date_str = line.split(': ')[1].strip()
+                day, month, year = shipment_date_str.split()
+                shipment_date_str = f'{day} {month_map.get(month.lower(), month.lower())} {year}'
+                shipment_date_obj = datetime.datetime.strptime(shipment_date_str, '%d %m %Y')
+                shipment_date = shipment_date_obj.strftime('%Y/%m/%d').replace('/', '')
+                shipment_info["Shipping Date"] = shipment_date
+            elif 'Ref. client: ' in line:
+                if line.split(': ')[1] != 'none':
+                    shipment_info["Customer Ref."] = line.split(': ')[1]
+                    shipment_info["Waybill"] = element[number + 5]
+            elif 'Frais de transport' in line:
+                shipment_info["Frais de transport"] = element[number + 1].replace(',', '.').replace(' ', '')
+            elif 'Colis' in line:
+                shipment_info["Packages"] = element[number + 1]
+            elif 'Poids réel' in line:
+                shipment_info["Actual Weight"] = element[number + 1].replace(',', '.').strip()
+                lb_match = re.search(r"(\d+\.\d+)\s*lb", shipment_info["Actual Weight"])
+                if lb_match:
+                    shipment_info["Actual Weight"] = lb_match.group(1).strip()
+            elif 'Poids facturé' in line:
+                match1 = re.search(r'(\d+,\d+)\s*(\w+)', element[number + 1])
+                if match1:
+                    weight, unit = match1.groups()
+                    if unit == 'lb':
+                        shipment_info["Billed Weight"] = weight.replace(',', '.').strip()
+                    elif unit == 'kg':
+                        shipment_info["Billed Weight"] = round((float(weight.replace(',', '.').strip()) * 2.20462),1)
+            elif 'Livré le' in line:
+                delivery_date_match = re.search(r'\d{1,2}\s+\w{3}\s+\d{4}', element[number + 1])
+                if delivery_date_match:
+                    delivery_date_str = delivery_date_match.group(0)
+                    day, month, year = delivery_date_str.split()
+                    delivery_date_str = f'{day} {month_map.get(month.lower(), month.lower())} {year}'
+                    delivery_date_obj = datetime.datetime.strptime(delivery_date_str, '%d %m %Y')
+                    delivery_date = delivery_date_obj.strftime('%Y/%m/%d').replace('/', '')
+                    shipment_info["Delivery Date"] = delivery_date
+            elif 'Frais de transport nets' in line:
+                shipment_info["Net Charge"] = element[number + 1].replace(',', '.').replace(' ', '')
+            elif 'Frais de transport*' in line:
+                shipment_info["Net Charge"] = element[number + 2].replace(',', '.').replace(' ', '')
+            elif 'Total' in line:
+                Total = element[number + 1].split(' $')[0].replace(',', '.').replace(' ', '')
+                Currency = element[number + 1].split(' $')[1]
+                shipment_info["Total"] = Total
+                shipment_info["Currency"] = Currency
+            
+        my_dict[f"shipment# {shipment_number}"] = shipment_info
+
+    for element in fedex_ground_shipment:        
+        shipment_info = {}
+        shipment_info["acc_list"] = []
+        for number, line in enumerate(element):
+            if 'Total FedEx Ground' in line:
+                break
+            if 'N° de suivi' in line:
+                waybill_match = re.search(r'\d{12,}', element[number + 6])
+                if waybill_match:
+                    shipment_info["Waybill"] = waybill_match.group(0)
+                    if 'Service' in element[number + 1]:
+                        shipment_info["Service Type"] = element[number + 7]
+                    if 'Emballage' in element[number + 2]:
+                        shipment_info["Packaging"] = element[number + 8]
+                else:
+                    waybill_match = re.search(r'\d{12,}', element[number + 5])
+                    if waybill_match:
+                        shipment_info["Waybill"] = waybill_match.group(0)
+                        if 'Service' in element[number + 1]:
+                            shipment_info["Service Type"] = element[number + 6]
+                        if 'Emballage' in element[number + 2]:
+                            shipment_info["Packaging"] = element[number + 7]
+            for charge in charges.CaChargeCode:
+                if charge == line:
+                    charge_name = charge
+                    charge_id = charges[charges.CaChargeCode == charge].ChargeID.values[0]
+                    if 'CAD' in element[number + 1] or 'USD' in element[number + 1]:
+                        continue
+                    value = element[number + 1].replace(',', '.').replace(' ', '')
+                    if '*' in charge_name:
+                        value = element[number + 2].replace(',', '.').replace(' ', '')
+                    acc_entry = {'charge_name': charge_name, 'charge_value': value, 'charge_id': charge_id}
+                    shipment_info["acc_list"].append(acc_entry)
+        for number, line in enumerate(element):
+            if 'Total FedEx Ground' in line:
+                break
+            if 'Date expédition:' in line:
+                shipment_number += 1
+                shipment_date_str = line.split(': ')[1].strip()
+                day, month, year = shipment_date_str.split()
+                shipment_date_str = f'{day} {month_map.get(month.lower(), month.lower())} {year}'
+                shipment_date_obj = datetime.datetime.strptime(shipment_date_str, '%d %m %Y')
+                shipment_date = shipment_date_obj.strftime('%Y/%m/%d').replace('/', '')
+                shipment_info["Shipping Date"] = shipment_date
+            elif 'Ref. client: ' in line:
+                if line.split(': ')[1] != 'none':
+                    shipment_info["Customer Ref."] = line.split(': ')[1]
+            elif 'Colis' in line:
+                shipment_info["Packages"] = element[number + 6]
+                if 'lb' in element[number + 6]:
+                    shipment_info["Packages"] = element[number + 5].replace(',', '.').replace('lb', '').strip()
+            elif 'Poids réel' in line:
+                shipment_info["Actual Weight"] = element[number + 6].replace(',', '.').replace('lb', '').strip()
+            elif 'Poids facturé' in line:
+                match1 = re.search(r'(\d+,\d+)\s*(\w+)', element[number + 6])
+                if 'Expéditeur' in element[number + 6]:
+                    match1 = re.search(r'(\d+,\d+)\s*(\w+)', element[number + 5])
+                if match1:
+                    weight, unit = match1.groups()
+                    if unit == 'lb':
+                        shipment_info["Billed Weight"] = weight.replace(',', '.').strip()
+                    elif unit == 'kg':
+                        shipment_info["Billed Weight"] = round((float(weight.replace(',', '.').strip()) * 2.20462),1)
+                if 'Frais de carburant' in element[number + 6]:
+                    shipment_info["Billed Weight"] = element[number + 1].replace(',', '.').replace('lb', '').strip()
+            elif 'Livré le' in line:
+                delivery_date_match = re.search(r'\d{1,2}\s+\w{3}\s+\d{4}', element[number + 1])
+                if delivery_date_match:
+                    delivery_date_str = delivery_date_match.group(0)
+                    day, month, year = delivery_date_str.split()
+                    delivery_date_str = f'{day} {month_map.get(month.lower(), month.lower())} {year}'
+                    delivery_date_obj = datetime.datetime.strptime(delivery_date_str, '%d %m %Y')
+                    delivery_date = delivery_date_obj.strftime('%Y/%m/%d').replace('/', '')
+                    shipment_info["Delivery Date"] = delivery_date
+            elif 'Frais de transport' in line:
+                shipment_info["Frais de transport"] = element[number + 1].replace(',', '.').replace(' ', '')
+            elif 'Total' in line and 'Total partiel Expéditeur' not in line:
+                Total = element[number + 1].split(' $')[0].replace(',', '.').replace(' ', '')
+                Currency = element[number + 1].split(' $')[1]
+                shipment_info["Total"] = Total
+                shipment_info["Currency"] = Currency
+            waybill_match = re.search(r'\d{12,}', line)
+            if waybill_match:
+                shipment_info["Waybill"] = waybill_match.group(0)
+                #print(shipment_info["Waybill"])
+        my_dict[f"shipment# {shipment_number}"] = shipment_info
+
+
+
+    return my_dict
+
+pdf_file_name = '2-582-66554.pdf' #input('Enter the PDF file name: ')
+pdf_name_without_extension = pdf_file_name.split('.')[0]
+output_file_name = f'{pdf_name_without_extension}.txt'
+testdict, wb_zone = findAddressAndZone(pdf_file_name)
+my_dict = cleaned_text(pdf_file_name)
+
+invoice_number = my_dict.get("Invoice Number")
+invoice_date = my_dict.get("Invoice Date")
+invoice_total = my_dict.get("Invoice Total")
+customer = my_dict.get("Customer")
+acc_list = my_dict.get("acc_list", [])
+
+
+EDI_Output = open(output_file_name, 'w')
+
+EDI = f'''ISA*00**00**ZZ*000007352*ZZ*000000092*20220908*1250*U*00401*000012253*0*P*~
+GS*IM*000007352*000000092*20220908*125003*12248*X*004010~
+ST*210*1000~
+B3**{invoice_number}**MX**{invoice_date}*{invoice_total}****PRLA*~
+C3*CAD~
+N9*12*~
+'''
+
+total_charges = 0.0
+transport_charge = 0.0
+net_charge_total = 0.0
+charge_totals = {}
+for shipment_number, shipment_info in my_dict.items():
+    if shipment_number.startswith("shipment# "):
+        for acc in shipment_info.get("acc_list", []):
+            charge_name = acc.get("charge_name")
+            charge_value = float(acc.get("charge_value"))
+            if charge_name in charge_totals:
+                charge_totals[charge_name] += charge_value
+            else:
+                charge_totals[charge_name] = charge_value
+        lcounter = 0
+        shipment_number = shipment_number[len("shipment# "):]
+        waybill = shipment_info.get("Waybill").strip()
+        customer_ref = shipment_info.get("Customer Ref.")
+        service_type = shipment_info.get("Service Type")
+        package_type = shipment_info.get("Packaging")
+        packages = shipment_info.get("Packages")
+        actual_weight = shipment_info.get("Actual Weight")
+        billed_weight = shipment_info.get("Billed Weight")
+        shipment_date = shipment_info.get("Shipping Date")
+        delivery_date = shipment_info.get("Delivery Date")
+        net_charge = shipment_info.get("Net Charge")
+        Frais_de_transport = shipment_info.get("Frais de transport")
+        Sous_total_Taxes = shipment_info.get("Sous-total - Taxes")
+        total = shipment_info.get("Total")
+        
+
+        EDI += f'LX*{shipment_number}~\n'
+        EDI += f'P1*1*{shipment_date}~\n'
+        if delivery_date != None:
+            EDI += f'P1*2*{delivery_date}~\n'
+        if testdict.get(waybill) != None:
+            EDI += f"N1*SH*{testdict.get(waybill)[0][0]}~\n"
+            EDI += f"N3*{testdict.get(waybill)[0][1]}~\n"
+            EDI += f"N4*{testdict.get(waybill)[0][2]}~\n"
+            EDI += f"N1*CN*{testdict.get(waybill)[1][0]}~\n"
+            EDI += f"N3*{testdict.get(waybill)[1][1]}~\n"
+            EDI += f"N4*{testdict.get(waybill)[1][2]}~\n"
+        EDI += f"N9*WY*{waybill}~\n"
+        if customer_ref != None:
+            EDI += f"N9*PO*{customer_ref}~\n"
+        if service_type != None:
+            EDI += f"N9*SR*{service_type}~\n"
+        if package_type != None:
+            EDI += f"N9*PK*{package_type}~\n"
+        for wb1 in wb_zone:
+            if wb1.get('wb') == waybill:
+                EDI += f"N9*ZN*{wb1.get('zone')}~\n"
+        if actual_weight is None:
+            EDI += f"L0*1***{billed_weight}*A3***{packages}*PCS**LB~\n"
+        else:
+            EDI += f"L0*1***{actual_weight}*B***{packages}*PCS**LB~\n"
+            if billed_weight is not None:
+                EDI += f"L0*2***{billed_weight}*A3******~\n"
+        lcounter += 1
+        if Frais_de_transport != None:
+            EDI += f"L1*{lcounter}***{Frais_de_transport}****BAS*Frais de transport~\n"
+            lcounter += 1
+            transport_charge += float(Frais_de_transport)
+        for acc in shipment_info.get("acc_list", []):
+            charge_name = acc.get("charge_name")
+            charge_value = float(acc.get("charge_value"))
+            charge_id = acc.get("charge_id")
+            EDI += f"L1*{lcounter}***{charge_value}****{charge_id}*{charge_name}~\n"
+            lcounter += 1
+            total_charges += charge_value
+        EDI += f"L1*{lcounter}***{total}****Total*Total~\n"
+
+EDI += '''SE*10222*11217265~
+GE*1*17856~
+IEA*1*000017866~'''
+
+EDI_Output.write(EDI)
+EDI_Output.close()
+nets1 = net_charge_total + transport_charge
+total_charges_and_net_charge = total_charges + nets1
+#print(f"Total Charges for the entire shipment: {total_charges}")
+# Calculate the total net charge for the entire shipment
+#print(f"Total Net Charge for the entire shipment: {nets1}")
+#print(f"Transport Charge: {transport_charge}")
+#print(total_charges_and_net_charge)
+#for charge_name, charge_total in charge_totals.items():
+    #print(f"Total {charge_name}: {charge_total}")
+print(f"EDI data generated and saved to '{output_file_name}'.")
