@@ -6,7 +6,7 @@ from datetime import date
 from tika import parser
 import pymssql
 import pandas as pd
-conn = pymssql.connect('23.136.240.72:1433', 'Hiteck1', 'Paw*8Z&12Hx$', "DLM")
+conn = pymssql.connect('edit this to your mysql database ipaddress')
 cursor = conn.cursor(as_dict=True)
 cursor.execute('SELECT  CaChargeCode as CaChargeCode, ChargeID FROM carcharge where idcakey = 000010378')
 charges = cursor.fetchall()
