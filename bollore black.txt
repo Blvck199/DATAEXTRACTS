@@ -1,0 +1,255 @@
+import re
+import PyPDF2
+import fitz
+import dateparser
+from datetime import date
+from tika import parser
+import pymssql
+import pandas as pd
+conn = pymssql.connect('23.136.240.72:1433', 'Hiteck1', 'Paw*8Z&12Hx$', "DLM")
+cursor = conn.cursor(as_dict=True)
+cursor.execute('SELECT  CaChargeCode as CaChargeCode, ChargeID FROM carcharge where idcakey = 000010378')
+charges = cursor.fetchall()
+conn.close()
+charges = pd.DataFrame(charges)
+
+
+def tikaText(PDF: str):
+    raw = parser.from_file(PDF)
+    text = raw['content'].split('\n')
+    return text
+
+def findline(word, arr):
+    for i in range(len(arr)):
+        if word in arr[i]:
+            return i
+    return -1
+
+def Text(pdf: str):
+    with fitz.open(pdf) as doc:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+
+    text = text.split('\n')
+
+    file = open(pdf, 'rb')
+    pdfReader = PyPDF2.PdfFileReader(file)
+    totalPages = pdfReader.numPages
+
+    return text, totalPages
+
+def find_carrier_info(test: list) -> tuple:
+    for i in range(len(test)):
+        if 'DC: 01' in test[i]:
+            first_line = test[i+2].split('      ')[0]
+            second_line = test[i+3]
+            third_line = test[i+4]
+            pc = third_line.split(' ')[-2:]
+            province = third_line.split(' ')[-3]
+            city = third_line.split(' ')[:1]
+            full_carrier_info = f"{first_line}, {second_line}, {pc[0]} {pc[1]}, {province}, {city[0]}"
+            return first_line, second_line, pc[0], pc[1], province, city[0], full_carrier_info
+    return None, None, None, None, None, None, "Carrier information not found"
+
+def cleaned_text(pdf: str):
+    text, totalPages = Text(pdf)
+    text1 = tikaText(pdf)
+    sliced = text[findline('AMOUNT - MONTANT', text):findline('VARIOUS', text)]
+    text = text[:findline('SUMMARY', text)]
+    constant_info = {}
+    shipment_info = {}
+    acc_list = []
+    all_shipment_info = []
+
+    carrier_info = find_carrier_info(text1)
+
+    for i, line in enumerate(text1):
+        if 'DC: 01' in line:
+            carrier_info = find_carrier_info(text1[i:i+5])
+            constant_info['carrier_info'] = carrier_info[-1]
+            break
+    for line in sliced:
+        invoice_date_match = re.search(r'\b\d{2}/\d{2}/\d{2}\b', line)
+        if invoice_date_match:
+            invoice_date_str = invoice_date_match.group(0)
+            year_str = "20" + invoice_date_str
+            invoice_date = year_str.replace('/', '')
+            constant_info['invoice_date'] = invoice_date
+
+        invoice_number_match = re.search(r'\b\d{8}\b', line)
+        if invoice_number_match:
+            invoice_number = invoice_number_match.group(0)
+            constant_info['invoice_number'] = invoice_number
+
+        if "AIR TRANSAT" in line:
+            client_name = "AIR TRANSAT"
+            constant_info['client_name'] = client_name
+            break
+    
+    waybill_values = {}  # Initialize a dictionary to store charge values for each waybill number
+    waybill_qst_values = {}  # Initialize a dictionary to store QST values for each waybill number
+    waybill_gst_values = {}  # Initialize a dictionary to store GST values for each waybill number
+
+    for number, line in enumerate(text):
+        if 'CC#:' in line:
+            waybill_number1 = line.split()[1]
+            if waybill_number1 not in waybill_values:
+                waybill_values[waybill_number1] = []  # Initialize an empty list for the waybill number
+                waybill_qst_values[waybill_number1] = []  # Initialize an empty list for QST values
+                waybill_gst_values[waybill_number1] = []  # Initialize an empty list for GST values
+
+        qst_value = 0  # Initialize qst_value before assignment
+        gst_value = 0  # Initialize gst_value before assignment
+
+        for charge in charges.CaChargeCode:
+            if charge in line:
+                charge_name = charge
+                charge_id = charges[charges.CaChargeCode == charge].ChargeID.values[0]
+                value_form = line.split(charge)[1].split()
+                value = line.split(charge)[1].split()[-1]
+                if len(value_form) == 1:
+                    charge_value = float(value_form[0].replace(',', '.'))
+                if len(value_form) == 2:
+                    gst_value = float(value_form[0].replace(',', '.'))
+                    charge_value = float(value_form[1].replace(',', '.'))
+                if len(value_form) == 3:
+                    qst_value = float(value_form[0].replace(',', '.'))
+                    gst_value = float(value_form[1].replace(',', '.')) 
+                    charge_value = float(value_form[2].replace(',', '.'))
+
+                # Update the lists of charge, QST, and GST values for the current waybill number
+                waybill_values[waybill_number1].append(charge_value)
+                waybill_qst_values[waybill_number1].append(qst_value)
+                waybill_gst_values[waybill_number1].append(gst_value)
+
+                acc_entry = {'waybill_number1': waybill_number1, 'charge_name': charge_name, 'charge_value': value, 'charge_id': charge_id}
+                acc_list.append(acc_entry)
+                break
+
+    constant_info['acc_list'] = acc_list
+
+    total_charges = {}
+    QST = {}
+    GST = {}
+    total = {}
+
+    for waybill_number, values in waybill_values.items():
+        total_charges[waybill_number] = sum(values)
+        QST[waybill_number] = round(sum(waybill_qst_values[waybill_number]), 2)
+        GST[waybill_number] = round(sum(waybill_gst_values[waybill_number]), 2)
+        total[waybill_number] = round(total_charges[waybill_number] + QST[waybill_number] + GST[waybill_number], 2)
+
+
+    total_dict = {}
+    for waybill_number in total_charges:
+        total_dict[waybill_number] = {
+            'total': round(total.get(waybill_number, 0), 2),
+            'QST': round(QST.get(waybill_number, 0), 2),
+            'GST': round(GST.get(waybill_number, 0), 2)
+        }
+
+    total_list = []
+    for waybill_number, values in total_dict.items():
+        total_list.append({'waybill_number': waybill_number, **values})
+
+    constant_info['total_list'] = total_list
+
+
+    for number, line in enumerate(text):
+        if 'CAD' in line:
+            total = line.split()[-1].replace(',', '')
+            constant_info['total'] = total
+        if 'CC#:' in line:
+            waybill_number = line.split()[1]
+            shipment_info['waybill_number'] = waybill_number
+        if 'PO#:' in line:
+            po_number = line.split()[3]
+            shipment_info['po_number'] = po_number
+        if 'VND:' in line:
+            supplier_name = line.split('VND: ')[1].split(' VFD:')[0].strip()
+            shipment_info['supplier_name'] = supplier_name
+            all_shipment_info.append(shipment_info)
+            shipment_info = {}
+    constant_info['all_shipment_info'] = all_shipment_info
+    return constant_info
+    
+
+pdf_file_name = '543410-01.pdf' #input('Enter the PDF file name: ')
+pdf_name_without_extension = pdf_file_name.split('.')[0]
+output_file_name = f'{pdf_name_without_extension}.txt'
+
+constant_info = cleaned_text(pdf_file_name)
+
+EDI_Output = open(output_file_name, 'w')
+
+all_shipment_info = constant_info['all_shipment_info']
+acc_list = constant_info['acc_list']
+total_list = constant_info['total_list']
+invoice_date = constant_info['invoice_date']
+invoice_number = constant_info['invoice_number']
+total = constant_info['total']
+
+EDI = f'''ISA*00**00**ZZ*000010378*ZZ*000000092*20220908*1250*U*00401*000012253*0*P*~
+GS*IM*000010378*000000092*20220908*125003*12248*X*004010~
+ST*210*1000~
+B3**{invoice_number}**MX**{invoice_date}*{total}****PRLA*~
+C3*CAD~
+N9*12*~
+'''
+i = 0
+lcounter = 1
+for shipment_info in all_shipment_info:
+    waybill_number = shipment_info['waybill_number']
+    po_number = shipment_info.get('po_number', None)
+    client_name = constant_info['client_name']
+    supplier_name = shipment_info['supplier_name']
+    carrier_info = constant_info['carrier_info'].split()
+    first_line = ' '.join(carrier_info[:4]).replace(',', '')
+    second_line = ' '.join(carrier_info[4:7]).replace(',', '')
+    postal_code = ' '.join(carrier_info[7:9]).replace(',', '').replace(' ', '')
+    province = carrier_info[9].replace(',', '')
+    city = carrier_info[10]
+    i += 1
+    lcounter = 1
+    EDI += f'LX*{i}~\n'
+    EDI += f"N9*WY*{waybill_number}~\n"
+    if po_number != None:
+        EDI += f"N9*PO*{po_number}~\n"
+    EDI += f"N1*CN*{client_name}~\n"
+    EDI += f"N1*SH*{first_line}~\n"
+    EDI += f"N3*{second_line}~\n"
+    EDI += f"N4*{city}*{province}*{postal_code}*~\n"
+    EDI += f"N9*VN*{supplier_name}~\n"
+    first_charge = True
+    for acc in acc_list:
+        if acc['waybill_number1'] == waybill_number:
+            charge_name = acc['charge_name']
+            charge_value = acc['charge_value']
+            if first_charge:
+                charge_id = "BAS"
+                first_charge = False
+            else:
+                charge_id = acc['charge_id']
+            EDI += f"L1*{lcounter}***{charge_value}****{charge_id}*{charge_name}~\n"
+            lcounter += 1
+    for total in total_list:
+        if total['waybill_number'] == waybill_number:
+            total_charge = total['total']
+            QST = total['QST']
+            GST = total['GST']
+            if QST != 0:
+                EDI += f"L1*{lcounter}***{QST}****QST*QST~\n"
+                lcounter += 1
+            if GST != 0:
+                EDI += f"L1*{lcounter}***{GST}****GST*GST~\n"
+                lcounter += 1
+            EDI += f"L1*{lcounter}***{total_charge}****TOTAL*TOTAL~\n"
+EDI += '''SE*10222*11217265~
+GE*1*17856~
+IEA*1*000017866~'''
+
+EDI_Output.write(EDI)
+EDI_Output.close()
+
+print(f"EDI data generated and saved to '{output_file_name}'.") 
